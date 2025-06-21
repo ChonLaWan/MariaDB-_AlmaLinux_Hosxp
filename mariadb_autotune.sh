@@ -103,12 +103,13 @@ sleep 3
 if ! command -v mariadbd &> /dev/null; then
     log_info "MariaDB ยังไม่ได้ติดตั้ง, เริ่มขั้นตอนการติดตั้ง..."
     sudo tee /etc/yum.repos.d/MariaDB.repo > /dev/null <<'EOF'
-# MariaDB 11.8 RedHatEnterpriseLinux repository list
+# MariaDB 11.4 for AlmaLinux 9
 [mariadb]
 name = MariaDB
-baseurl = https://mirror.kku.ac.th/mariadb/yum/11.8/rhel/$releasever/$basearch
-gpgkey = https://mirror.kku.ac.th/mariadb/yum/RPM-GPG-KEY-MariaDB
-gpgcheck = 1
+baseurl = https://rpm.mariadb.org/11.4/rhel/9/x86_64
+gpgkey=https://rpm.mariadb.org/RPM-GPG-KEY-MariaDB
+gpgcheck=1
+enabled=1
 EOF
     sudo dnf install MariaDB-server MariaDB-client MariaDB-backup -y
     sudo systemctl enable --now mariadb
