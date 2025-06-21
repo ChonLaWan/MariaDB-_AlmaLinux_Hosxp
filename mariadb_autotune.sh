@@ -1,20 +1,17 @@
 #!/bin/bash
 
 # ==============================================================================
-#   สคริปต์ปรับจูน MariaDB อัตโนมัติสำหรับ AlmaLinux 9 (โปรไฟล์ HOSxP)
+#   สคริปต์ปรับจูน MariaDB อัจฉริยะสำหรับ AlmaLinux 9 (โปรไฟล์ HOSxP)
 # ==============================================================================
 #
-#   ผู้จัดทำ: ChonLaWan
-#   เวอร์ชัน: 3.0 - Full Installer (ปรับปรุงล่าสุด 2025-06-21)
+#   ผู้จัดทำ: ChonLaWan & Gemini
+#   เวอร์ชัน: 3.2 (ปรับปรุงล่าสุด 2025-06-22) - แก้ไข Bug และใส่ Config แบบเต็ม
 #
-#   สคริปต์นี้จะทำการติดตั้งและปรับจูน MariaDB 11.x โดยอัตโนมัติ
-#   สำหรับระบบที่ต้องการประสิทธิภาพสูง (เช่น HOSxP) บนเซิร์ฟเวอร์
-#   ที่มี RAM 40-60GB และใช้สตอเรจแบบ SSD
-#
-#   ** คำเตือน **
-#   - ควรใช้สคริปต์นี้กับเครื่องที่ติดตั้ง MariaDB ใหม่เท่านั้น
-#   - ควรทำ Snapshot หรือสำรองข้อมูลก่อนรันสคริปต์เสมอ
-#   - สคริปต์นี้จะเขียนทับไฟล์ /etc/sysctl.conf และ /etc/my.cnf
+#   คุณสมบัติ:
+#   - ตรวจสอบ RAM ของเครื่องและคำนวณค่า Config ที่เหมาะสมอัตโนมัติ
+#   - หากรันครั้งแรก: จะทำการติดตั้งและสร้างไฟล์ Config ที่ดีที่สุดให้ (แบบเต็ม)
+#   - หากรันซ้ำ: จะตรวจสอบและแก้ไขเฉพาะค่าที่ยังไม่ถูกต้อง โดยไม่ลบ
+#     คอมเมนต์หรือการตั้งค่าอื่นๆ ที่มีอยู่เดิม ทำให้ปลอดภัยในการรันซ้ำ
 #
 # ==============================================================================
 
@@ -22,26 +19,35 @@
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 RED='\033[0;31m'
-NC='\033[0m' # ไม่ใส่สี
+NC='\033[0m'
 
-# --- ตัวแปรการตั้งค่า ---
-MARIADB_VERSION="11.8"
-RAM_GB=60 # RAM (GB) ของเครื่องเป้าหมายสำหรับปรับจูน
-CPU_CORES=$(nproc)
+# --- ตัวแปรพื้นฐาน ---
 DB_USER="mysql"
 DB_GROUP="mysql"
 
 # --- ฟังก์ชันสำหรับแสดงข้อความ ---
-log_info() {
-    echo -e "${GREEN}[INFO] $1${NC}"
-}
+log_info() { echo -e "${GREEN}[INFO] $1${NC}"; }
+log_warn() { echo -e "${YELLOW}[WARN] $1${NC}"; }
+log_error() { echo -e "${RED}[ERROR] $1${NC}"; }
 
-log_warn() {
-    echo -e "${YELLOW}[WARN] $1${NC}"
-}
+# --- ฟังก์ชันสำหรับแก้ไขค่าในไฟล์ Config (เวอร์ชันแก้ไข Bug) ---
+update_config() {
+    local file="$1"
+    local key="$2"
+    local value="$3"
+    
+    if [ ! -f "$file" ]; then
+        log_warn "ไม่พบไฟล์ $file, ข้ามการอัปเดต"
+        return
+    fi
 
-log_error() {
-    echo -e "${RED}[ERROR] $1${NC}"
+    if grep -qE "^\s*#?\s*${key}\s*=" "$file"; then
+        sudo sed -i -E "s/^(\s*#?\s*${key}\s*=\s*)[^#\s]*(.*)/\\1${value}\\2/" "$file"
+        log_info "อัปเดตค่า '$key' ใน $file เป็น '$value'"
+    else
+        echo "$key = $value" | sudo tee -a "$file" > /dev/null
+        log_warn "ไม่พบค่า '$key' ใน $file, ทำการเพิ่มค่าใหม่"
+    fi
 }
 
 # --- ตรวจสอบสิทธิ์ Root ---
@@ -50,69 +56,75 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-log_info "เริ่มการตั้งค่าเซิร์ฟเวอร์ MariaDB สำหรับ Production..."
-log_info "สเปคเป้าหมาย -> RAM: ${RAM_GB}GB | CPU Cores: ${CPU_CORES}"
-sleep 2
-
 # ==================================
-# ขั้นตอนที่ 1: ติดตั้ง MariaDB Server
+#  ขั้นตอนที่ 1: ตรวจสอบ Hardware และคำนวณค่า Config
 # ==================================
-log_info "ขั้นตอนที่ 1: การตั้งค่า Repository ของ MariaDB ${MARIADB_VERSION}..."
+log_info "ขั้นตอนที่ 1: ตรวจสอบ Hardware และคำนวณค่า Config ที่เหมาะสม..."
 
-# สร้างไฟล์ Repository (.repo) โดยใช้ Mirror ของ ม.ขอนแก่น ตามที่กำหนด
-# การใช้วิธีนี้จะทำให้สามารถกำหนด Mirror ที่ต้องการได้โดยตรง
-sudo tee /etc/yum.repos.d/MariaDB.repo > /dev/null <<'EOF'
-# MariaDB 11.8 RedHatEnterpriseLinux repository list - created 2025-06-21 15:27 UTC
-# https://mariadb.org/download/
-[mariadb]
-name = MariaDB
-# rpm.mariadb.org is a dynamic mirror if your preferred mirror goes offline. See https://mariadb.org/mirrorbits/ for details.
-# baseurl = https://rpm.mariadb.org/11.8/rhel/$releasever/$basearch
-baseurl = https://mirror.kku.ac.th/mariadb/yum/11.8/rhel/$releasever/$basearch
-# gpgkey = https://rpm.mariadb.org/RPM-GPG-KEY-MariaDB
-gpgkey = https://mirror.kku.ac.th/mariadb/yum/RPM-GPG-KEY-MariaDB
-gpgcheck = 1
-EOF
+TOTAL_RAM_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+TOTAL_RAM_GB=$(( (TOTAL_RAM_KB + 524288) / 1048576 )) # ปัดเศษให้ใกล้เคียงที่สุด
+CPU_CORES=$(nproc)
 
-if [ $? -ne 0 ]; then
-    log_error "ล้มเหลวในการสร้างไฟล์ MariaDB repository"
-    exit 1
+log_info "ตรวจพบ RAM ทั้งหมด: ${TOTAL_RAM_GB} GB"
+log_info "ตรวจพบ CPU Cores: ${CPU_CORES} Cores"
+
+# --- คำนวณค่า Config แบบไดนามิก ---
+if [ "$TOTAL_RAM_GB" -lt 32 ]; then
+    INNODB_BUFFER_POOL_GB=$((TOTAL_RAM_GB * 70 / 100))
+elif [ "$TOTAL_RAM_GB" -lt 128 ]; then
+    INNODB_BUFFER_POOL_GB=$((TOTAL_RAM_GB * 65 / 100))
+else
+    INNODB_BUFFER_POOL_GB=$((TOTAL_RAM_GB * 60 / 100))
+fi
+[ "$INNODB_BUFFER_POOL_GB" -lt 2 ] && INNODB_BUFFER_POOL_GB=2 # ค่าต่ำสุดคือ 2G
+
+SHMMAX=$((TOTAL_RAM_GB * 1024 * 1024 * 1024 * 90 / 100))
+SHMALL=$((SHMMAX / 4096))
+HUGEPAGES=$((INNODB_BUFFER_POOL_GB * 1024 / 2))
+
+INNODB_LOG_FILE_SIZE_MB=$((INNODB_BUFFER_POOL_GB * 1024 / 4))
+if [ "$INNODB_LOG_FILE_SIZE_MB" -gt 4096 ]; then
+    INNODB_LOG_FILE_SIZE="4G"
+elif [ "$INNODB_LOG_FILE_SIZE_MB" -lt 512 ]; then
+    INNODB_LOG_FILE_SIZE="512M"
+else
+    INNODB_LOG_FILE_SIZE="${INNODB_LOG_FILE_SIZE_MB}M"
 fi
 
-log_info "กำลังติดตั้ง MariaDB Server, Client, และ Backup..."
-dnf install MariaDB-server MariaDB-client MariaDB-backup -y
-if [ $? -ne 0 ]; then
-    log_error "ล้มเหลวในการติดตั้งแพ็กเกจ MariaDB"
-    exit 1
-fi
-
-log_info "กำลังเปิดใช้งานและเริ่ม service ของ MariaDB..."
-systemctl enable --now mariadb
-if [ $? -ne 0 ]; then
-    log_error "ล้มเหลวในการเริ่ม service ของ MariaDB"
-    exit 1
-fi
-
-log_warn "ติดตั้ง MariaDB เรียบร้อยแล้ว กรุณารัน 'mariadb-secure-installation' ด้วยตนเองหลังสคริปต์นี้ทำงานเสร็จ"
+log_info "ค่าที่จะใช้ในการปรับจูน:"
+log_info "  - innodb_buffer_pool_size: ${INNODB_BUFFER_POOL_GB}G"
+log_info "  - innodb_log_file_size: ${INNODB_LOG_FILE_SIZE}"
+log_info "  - vm.nr_hugepages: ${HUGEPAGES}"
 sleep 3
 
 # ==================================
-# ขั้นตอนที่ 2: ปรับจูน Kernel (sysctl)
+# ขั้นตอนที่ 2: ติดตั้ง MariaDB (หากยังไม่มี)
 # ==================================
-log_info "ขั้นตอนที่ 2: การปรับจูนค่า Kernel..."
-BACKUP_SYSCTL="/etc/sysctl.conf.bak.$(date +%F)"
-log_info "กำลังสำรองไฟล์ /etc/sysctl.conf ไปที่ ${BACKUP_SYSCTL}"
-cp /etc/sysctl.conf "${BACKUP_SYSCTL}"
+if ! command -v mariadbd &> /dev/null; then
+    log_info "MariaDB ยังไม่ได้ติดตั้ง, เริ่มขั้นตอนการติดตั้ง..."
+    sudo tee /etc/yum.repos.d/MariaDB.repo > /dev/null <<'EOF'
+# MariaDB 11.8 RedHatEnterpriseLinux repository list
+[mariadb]
+name = MariaDB
+baseurl = https://mirror.kku.ac.th/mariadb/yum/11.8/rhel/$releasever/$basearch
+gpgkey = https://mirror.kku.ac.th/mariadb/yum/RPM-GPG-KEY-MariaDB
+gpgcheck = 1
+EOF
+    sudo dnf install MariaDB-server MariaDB-client MariaDB-backup -y
+    sudo systemctl enable --now mariadb
+    log_warn "ติดตั้ง MariaDB เรียบร้อยแล้ว กรุณารัน 'mariadb-secure-installation' ด้วยตนเองหลังสคริปต์นี้ทำงานเสร็จ"
+else
+    log_info "ตรวจพบ MariaDB ติดตั้งอยู่แล้ว, ข้ามขั้นตอนการติดตั้ง"
+fi
 
-# คำนวณค่า shmmax และ shmall จาก RAM
-SHMMAX=$(( RAM_GB * 1024 * 1024 * 1024 * 85 / 100 ))
-SHMALL=$(( SHMMAX / 4096 ))
-
-# คำนวณ HugePages (จากขนาด Page 2M)
-INNODB_BUFFER_POOL_GB=38
-HUGEPAGES=$(( INNODB_BUFFER_POOL_GB * 1024 / 2 ))
-
-tee /etc/sysctl.conf > /dev/null <<EOF
+# ==================================
+# ขั้นตอนที่ 3: ตรวจสอบและปรับจูน Kernel (sysctl)
+# ==================================
+log_info "ขั้นตอนที่ 3: ตรวจสอบและปรับจูนค่า Kernel (/etc/sysctl.conf)..."
+if [ ! -f /etc/sysctl.conf ] || ! grep -q "MariaDB Production Server" /etc/sysctl.conf; then
+    log_warn "/etc/sysctl.conf ยังไม่เคยถูกตั้งค่าโดยสคริปต์, กำลังสร้างไฟล์ใหม่..."
+    sudo cp /etc/sysctl.conf /etc/sysctl.conf.bak.$(date +%F) 2>/dev/null
+    sudo tee /etc/sysctl.conf > /dev/null <<EOF
 # ========================================================
 # ⚙️ การตั้งค่า Kernel สำหรับ MariaDB Production Server (โดยสคริปต์)
 # ========================================================
@@ -128,48 +140,46 @@ net.core.somaxconn = 4096         # จำนวนสูงสุดของ c
 net.ipv4.tcp_tw_reuse = 1         # อนุญาตให้ใช้ซ็อกเก็ตในสถานะ TIME-WAIT ซ้ำได้
 kernel.io_uring_disabled = 0    # เปิดใช้งาน io_uring API เพื่อประสิทธิภาพ I/O สูงสุด
 EOF
-
-log_info "กำลัง 적용การตั้งค่า kernel ใหม่..."
-sysctl -p
-if [ $? -ne 0 ]; then
-    log_error "ล้มเหลวในการ 적용ค่า kernel กรุณาตรวจสอบไฟล์ /etc/sysctl.conf"
-    exit 1
+else
+    log_info "ตรวจสอบค่าใน /etc/sysctl.conf..."
+    update_config "/etc/sysctl.conf" "kernel.shmmax" "${SHMMAX}"
+    update_config "/etc/sysctl.conf" "kernel.shmall" "${SHMALL}"
+    update_config "/etc/sysctl.conf" "vm.nr_hugepages" "${HUGEPAGES}"
 fi
+sudo sysctl -p
 
 # ==================================
-# ขั้นตอนที่ 3: ตั้งค่า Systemd Limits
+# ขั้นตอนที่ 4: ตรวจสอบและตั้งค่า Systemd Limits
 # ==================================
-log_info "ขั้นตอนที่ 3: การตั้งค่า Limits ของ Systemd สำหรับ MariaDB..."
-mkdir -p /etc/systemd/system/mariadb.service.d
-
-tee /etc/systemd/system/mariadb.service.d/override.conf > /dev/null <<'EOF'
+log_info "ขั้นตอนที่ 4: ตรวจสอบและตั้งค่า Systemd Limits..."
+LIMIT_FILE="/etc/systemd/system/mariadb.service.d/override.conf"
+sudo mkdir -p /etc/systemd/system/mariadb.service.d
+# สร้างไฟล์ใหม่เสมอเพื่อความแน่นอน
+sudo tee "$LIMIT_FILE" > /dev/null <<'EOF'
 [Service]
-LimitNOFILE=100000
+LimitNOFILE=150000
 LimitMEMLOCK=infinity
 EOF
-
-log_info "กำลังโหลดการตั้งค่าของ systemd ใหม่..."
-systemctl daemon-reload
+log_info "สร้าง/อัปเดตไฟล์ $LIMIT_FILE เรียบร้อย"
+sudo systemctl daemon-reload
 
 # ==================================
-# ขั้นตอนที่ 4: ตั้งค่า MariaDB (my.cnf)
+# ขั้นตอนที่ 5: ตรวจสอบและตั้งค่า MariaDB (my.cnf)
 # ==================================
-log_info "ขั้นตอนที่ 4: การสร้างไฟล์ my.cnf ที่ปรับจูนแล้ว..."
-BACKUP_MYCNF="/etc/my.cnf.bak.$(date +%F)"
-log_info "กำลังสำรองไฟล์ /etc/my.cnf ไปที่ ${BACKUP_MYCNF}"
-if [ -f /etc/my.cnf ]; then
-    cp /etc/my.cnf "${BACKUP_MYCNF}"
-fi
+log_info "ขั้นตอนที่ 5: ตรวจสอบและปรับจูน /etc/my.cnf..."
+if [ ! -f /etc/my.cnf ]; then
+    log_warn "/etc/my.cnf ไม่พบไฟล์, กำลังสร้างไฟล์ใหม่ทั้งหมด..."
+    sudo cp /etc/my.cnf /etc/my.cnf.bak.$(date +%F) 2>/dev/null
+    
+    # ตรวจสอบชนิดของดิสก์
+    DISK_TYPE_CODE=$(cat /sys/block/$(lsblk -no pkname "$(df /var/lib/mysql | awk 'NR==2 {print $1}')" | head -n 1)/queue/rotational 2>/dev/null)
+    INNODB_FLUSH_NEIGHBORS=${DISK_TYPE_CODE:-0}
+    DISK_TYPE_TEXT=$([ "$INNODB_FLUSH_NEIGHBORS" -eq 0 ] && echo "SSD/NVMe" || echo "HDD/SAS")
 
-# ตรวจสอบชนิดของดิสก์เพื่อตั้งค่า innodb_flush_neighbors (0 สำหรับ SSD, 1 สำหรับ HDD)
-DISK_TYPE=$(cat /sys/block/$(lsblk -no pkname "$(df /var/lib/mysql | awk 'NR==2 {print $1}')" | head -n 1)/queue/rotational 2>/dev/null)
-INNODB_FLUSH_NEIGHBORS=${DISK_TYPE:-0} # หากตรวจไม่พบ ให้ใช้ค่า 0 (SSD) เป็นค่าเริ่มต้น
-log_info "ชนิดของดิสก์ที่ตรวจพบ: $([ "$INNODB_FLUSH_NEIGHBORS" -eq 0 ] && echo "SSD/NVMe" || echo "HDD/SAS"). ตั้งค่า innodb_flush_neighbors=${INNODB_FLUSH_NEIGHBORS}."
-
-tee /etc/my.cnf > /dev/null <<EOF
+    sudo tee /etc/my.cnf > /dev/null <<EOF
 # ===================================================================
-# 🔧 Configuration File สำหรับ MariaDB 11 (ปรับจูนโดยสคริปต์สำหรับ HOSxP)
-#    - Hardware: RAM \${RAM_GB}GB, CPU \${CPU_CORES} Cores, Disk $([ "$INNODB_FLUSH_NEIGHBORS" -eq 0 ] && echo "SSD/NVMe" || echo "HDD/SAS")
+# 🔧 Configuration File สำหรับ MariaDB 11 (สร้างโดยสคริปต์อัตโนมัติ)
+#    - Hardware: RAM ${TOTAL_RAM_GB}GB, CPU ${CPU_CORES} Cores, Disk ${DISK_TYPE_TEXT}
 #    - เน้นประสิทธิภาพสูงสุดสำหรับ InnoDB และรองรับภาษาไทย TIS-620
 # ===================================================================
 
@@ -249,8 +259,8 @@ skip-slave-start=1                      # ไม่เริ่ม Replication �
 # ------------------------------------
 default_storage_engine=InnoDB           # ตั้งให้ InnoDB เป็น Storage Engine เริ่มต้น
 innodb_file_per_table=1                 # สร้างไฟล์ .ibd แยกสำหรับแต่ละตาราง
-innodb_buffer_pool_size=${INNODB_BUFFER_POOL_GB}G          # ขนาดของ Buffer Pool (หัวใจของ InnoDB) ประมาณ 60-70% ของ RAM
-innodb_log_file_size=4G                 # ขนาดของ Redo Log File
+innodb_buffer_pool_size=${INNODB_BUFFER_POOL_GB}G          # ขนาดของ Buffer Pool (หัวใจของ InnoDB) คำนวณจาก RAM
+innodb_log_file_size=${INNODB_LOG_FILE_SIZE}                # ขนาดของ Redo Log File คำนวณจาก Buffer Pool
 innodb_log_buffer_size=64M              # Buffer สำหรับ Redo Log ก่อนเขียนลงดิสก์
 innodb_flush_log_at_trx_commit=2        # เขียน Log ลง OS Cache ทุกครั้งที่ Commit (เพื่อประสิทธิภาพ)
 innodb_flush_method=O_DIRECT_NO_FSYNC   # วิธีการเขียนข้อมูลลงดิสก์ (ดีที่สุดสำหรับ Linux ที่ใช้ Hardware RAID/SSD)
@@ -268,6 +278,7 @@ innodb_adaptive_flushing=1              # เปิดให้ InnoDB ปรั
 innodb_adaptive_hash_index=0            # ปิด Adaptive Hash Index (มักดีกว่าสำหรับ Workload ส่วนใหญ่)
 innodb_use_native_aio=1                 # ใช้ Native AIO ของ Linux
 innodb_stats_persistent=1               # ทำให้สถิติของตารางคงอยู่หลังรีสตาร์ท
+max_prepared_stmt_count=1000000
 
 # ------------------------------------
 # # HugePages & Memory Lock #
@@ -288,33 +299,37 @@ log_queries_not_using_indexes=1         # บันทึก Query ที่ไ�
 # ------------------------------------
 max_allowed_packet=512M                 # ขนาด Packet สูงสุดที่รับได้
 skip-external-locking                   # ปิดการล็อกไฟล์ภายนอก
-slave_compressed_protocol=1             # บีบอัดข้อมูลระหว่าง Master-Slave
+slave_compressed_protocol=1
+
+# --- Performance Schema ---
+performance_schema=ON
 
 [mysqldump]
-quick                                   # ให้ mysqldump อ่านข้อมูลทีละแถวเพื่อลดการใช้ Memory
-max_allowed_packet=512M                 # ขนาด Packet สูงสุดสำหรับ mysqldump
+quick
+max_allowed_packet=512M
 
 [mysql]
-no-auto-rehash                          # ปิดการทำ auto-rehash ของ command line เพื่อความเร็ว
-default-character-set=tis620            # Character Set เริ่มต้นสำหรับ command line
+no-auto-rehash
+default-character-set=tis620
 EOF
+else
+    log_info "ไฟล์ /etc/my.cnf มีอยู่แล้ว, กำลังตรวจสอบและอัปเดตค่าที่สำคัญ..."
+    update_config "/etc/my.cnf" "innodb_buffer_pool_size" "${INNODB_BUFFER_POOL_GB}G"
+    update_config "/etc/my.cnf" "innodb_log_file_size" "${INNODB_LOG_FILE_SIZE}"
+    update_config "/etc/my.cnf" "table_open_cache_instances" "${CPU_CORES}"
+fi
 
 # ==================================
-# ขั้นตอนที่ 5: สร้างไฟล์ Log และกำหนดสิทธิ์
+# ขั้นตอนที่ 6: รีสตาร์ทและตรวจสอบ
 # ==================================
-log_info "ขั้นตอนที่ 5: การสร้างไฟล์ Log และกำหนดสิทธิ์การเข้าถึง..."
-touch /var/log/mysqld.log /var/log/mariadb-slow.log
-chown ${DB_USER}:${DB_GROUP} /var/log/mysqld.log /var/log/mariadb-slow.log
-chmod 640 /var/log/mysqld.log /var/log/mariadb-slow.log
+log_info "ขั้นตอนที่ 6: สร้างไฟล์ Log (หากยังไม่มี) และรีสตาร์ท MariaDB..."
+sudo touch /var/log/mysqld.log /var/log/mariadb-slow.log
+sudo chown ${DB_USER}:${DB_GROUP} /var/log/mysqld.log /var/log/mariadb-slow.log
+sudo chmod 640 /var/log/mysqld.log /var/log/mariadb-slow.log
 
-# ==================================
-# ขั้นตอนที่ 6: รีสตาร์ทและขั้นตอนสุดท้าย
-# ==================================
-log_info "ขั้นตอนที่ 6: การรีสตาร์ท MariaDB เพื่อใช้ค่าคอนฟิกใหม่ทั้งหมด..."
-systemctl restart mariadb
+sudo systemctl restart mariadb
 if [ $? -ne 0 ]; then
-    log_error "MariaDB รีสตาร์ทไม่สำเร็จ กรุณาตรวจสอบ log ด้วยคำสั่ง 'journalctl -u mariadb -n 100'"
-    log_error "ปัญหาที่พบบ่อย: permission ของไฟล์ log ไม่ถูกต้อง หรือพิมพ์ผิดใน /etc/my.cnf"
+    log_error "MariaDB รีสตาร์ทไม่สำเร็จ! กรุณาตรวจสอบ Log ด้วย 'journalctl -u mariadb -n 100'"
     exit 1
 fi
 
@@ -322,21 +337,18 @@ log_info "รอสักครู่เพื่อให้ service เริ�
 sleep 5
 
 # --- การตรวจสอบขั้นสุดท้าย ---
-systemctl status mariadb --no-pager
+log_info "ตรวจสอบสถานะ MariaDB..."
+sudo systemctl status mariadb --no-pager
 
-# ตรวจสอบการใช้งาน HugePages
 HUGEPAGES_USED=$(grep Huge /proc/$(pidof mariadbd)/smaps 2>/dev/null | awk '{sum += $2} END {print sum / 1024}')
 if [ -n "$HUGEPAGES_USED" ] && [ "$HUGEPAGES_USED" -gt 0 ]; then
     log_info "MariaDB ใช้งาน HugePages อยู่: ${HUGEPAGES_USED} MB"
 else
-    log_warn "ไม่พบการใช้งาน HugePages อาจมีปัญหาในการตั้งค่า vm.hugetlb_shm_group หรือหน่วยความจำไม่พอ"
+    log_warn "ไม่พบการใช้งาน HugePages อาจมีปัญหาในการตั้งค่าหรือหน่วยความจำไม่พอ"
 fi
-
 
 log_info "${GREEN}=====================================================${NC}"
 log_info "${GREEN}   สคริปต์ปรับจูน MariaDB ทำงานเสร็จสมบูรณ์!         ${NC}"
 log_info "${GREEN}=====================================================${NC}"
-log_warn "สำคัญ: กรุณารัน 'sudo mariadb-secure-installation' ทันที"
-log_warn "เพื่อตั้งรหัสผ่าน root และทำให้เซิร์ฟเวอร์ปลอดภัย"
+log_warn "สำคัญ: หากเป็นการติดตั้งครั้งแรก กรุณารัน 'sudo mariadb-secure-installation' ทันที"
 echo ""
-```
