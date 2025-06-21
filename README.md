@@ -349,3 +349,5 @@ grep Huge /proc/$(pidof mariadbd)/smaps | awk '{sum += $2} END {print sum / 1024
 ```
 
 เมื่อทำครบทุกขั้นตอน ระบบ MariaDB ของคุณจะได้รับการปรับจูนเพื่อประสิทธิภาพสูงสุดตามแนวทางที่ถูกต้องครับ
+
+Credit: [Download MariaDB Server - MariaDB.org]([https://mariadb.org/download/](https://mariadb.org/download/?t=repo-config&d=Red+Hat+Enterprise+Linux+9&v=11.8&r_m=kku))
